@@ -7,8 +7,9 @@ const jwt = require('jsonwebtoken');
 const cors = require('cors');
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-// ── CORS ─────────────────────────────────────────────────────
+// ── CORS ──────────────────────────────────────────────────────
 const rawOrigin = (process.env.CLIENT_ORIGIN || '').replace(/\/$/, '');
 
 app.use(cors({
@@ -26,7 +27,7 @@ app.use(cors({
 app.options('*', cors());
 app.use(express.json());
 
-// ── MongoDB (cached connection for serverless) ────────────────
+// ── MongoDB (cached for serverless) ───────────────────────────
 let isConnected = false;
 
 async function connectDB() {
@@ -37,9 +38,10 @@ async function connectDB() {
         : rawUri;
     await mongoose.connect(mongoUri);
     isConnected = true;
+    console.log('MongoDB connected');
 }
 
-// ── User Schema ───────────────────────────────────────────────
+// ── User Schema ────────────────────────────────────────────────
 const userSchema = new mongoose.Schema({
     name:      { type: String, required: true, trim: true },
     email:     { type: String, required: true, unique: true, lowercase: true, trim: true },
@@ -52,7 +54,7 @@ const userSchema = new mongoose.Schema({
 
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 
-// ── Helpers ───────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────
 const JWT_SECRET = process.env.JWT_SECRET || 'change-in-production';
 
 const signToken = (user) => jwt.sign(
@@ -79,20 +81,24 @@ const adminMiddleware = (req, res, next) => {
     next();
 };
 
-// Wrap every route with DB connection
 const withDB = (fn) => async (req, res) => {
-    await connectDB();
-    return fn(req, res);
+    try {
+        await connectDB();
+        return fn(req, res);
+    } catch (err) {
+        console.error('DB connection error:', err.message);
+        return res.status(500).json({ success: false, message: 'Database connection failed' });
+    }
 };
 
-// ── Health check ──────────────────────────────────────────────
+// ── Health check ───────────────────────────────────────────────
 app.get('/', (req, res) => {
     res.json({ status: 'PLC SimTel Auth Server running', time: new Date() });
 });
 
-// ════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════
 //  AUTH ROUTES
-// ════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════
 
 app.post('/api/auth/register', withDB(async (req, res) => {
     try {
@@ -158,9 +164,9 @@ app.post('/api/auth/logout', authMiddleware, (req, res) => {
     res.json({ success: true, message: 'Logged out' });
 });
 
-// ════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════
 //  ADMIN ROUTES
-// ════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════
 
 app.post('/api/admin/make-admin', withDB(async (req, res) => {
     try {
@@ -252,5 +258,14 @@ app.post('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req,
     }
 }));
 
-// ── Export for Vercel ─────────────────────────────────────────
-module.exports = app;
+// ── Start: works locally AND exports for Vercel ───────────────
+if (require.main === module) {
+    connectDB().then(() => {
+        app.listen(PORT, () => console.log(`Auth server running on port ${PORT}`));
+    }).catch(err => {
+        console.error('Failed to connect to MongoDB:', err.message);
+        process.exit(1);
+    });
+} else {
+    module.exports = app;
+}
