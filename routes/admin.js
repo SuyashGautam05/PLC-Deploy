@@ -3,6 +3,8 @@ const bcrypt = require('bcryptjs');
 const User = require('../models/User');
 const { verifyToken, requireAdmin } = require('../middleware/auth');
 const { isValidGmail } = require('../utils/validateEmail');
+const { generateOTP } = require('../utils/otp');
+const { sendOTPEmail } = require('../utils/sendEmail');
 
 const router = express.Router();
 
@@ -12,7 +14,7 @@ router.use(verifyToken, requireAdmin);
 // GET /api/admin/users
 router.get('/users', async (req, res) => {
   try {
-    const users = await User.find().select('-password').sort({ createdAt: -1 });
+    const users = await User.find().select('-password -otp').sort({ createdAt: -1 });
     res.json({ success: true, users });
   } catch (err) {
     console.error(err);
@@ -21,15 +23,17 @@ router.get('/users', async (req, res) => {
 });
 
 // POST /api/admin/users  body: { name, email, password, role }
-// Admin manually creates + activates a user. Email must be a real @gmail.com address.
+// Admin creates the account, but it stays INACTIVE until the user themself
+// enters the OTP emailed to them (see routes/verify.js).
 router.post('/users', async (req, res) => {
+  let createdUser = null;
+
   try {
     const { name, email, password, role } = req.body;
 
     if (!name || !email || !password) {
       return res.status(400).json({ success: false, message: 'Name, email and password are required.' });
     }
-
     if (password.length < 6) {
       return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.' });
     }
@@ -48,30 +52,54 @@ router.post('/users', async (req, res) => {
       return res.status(409).json({ success: false, message: 'A user with this email already exists.' });
     }
 
-    const hashed = await bcrypt.hash(password, 10);
-    const user = await User.create({
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const rawOtp = generateOTP();
+    const hashedOtp = await bcrypt.hash(rawOtp, 10);
+    const otpExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    createdUser = await User.create({
       name: name.trim(),
       email: normalizedEmail,
-      password: hashed,
+      password: hashedPassword,
       role: role === 'admin' ? 'admin' : 'user',
-      isActive: true // "Create & Activate" - admin is creating this user directly
+      isActive: false,
+      otp: hashedOtp,
+      otpExpires
     });
 
-    const { password: _pw, ...safeUser } = user.toObject();
-    res.status(201).json({ success: true, message: 'User created and activated.', user: safeUser });
+    // Attempt to email the OTP. If this fails, roll back the user creation -
+    // there's no point leaving an account nobody can ever verify.
+    await sendOTPEmail(normalizedEmail, rawOtp, name.trim());
+
+    const { password: _pw, otp: _otp, ...safeUser } = createdUser.toObject();
+    res.status(201).json({
+      success: true,
+      message: 'User created. A verification code has been emailed to them - they must enter it themselves to activate the account.',
+      user: safeUser
+    });
   } catch (err) {
     console.error(err);
+
+    if (createdUser) {
+      await User.findByIdAndDelete(createdUser._id).catch(() => {});
+    }
+
     if (err.name === 'ValidationError') {
       return res.status(400).json({ success: false, message: Object.values(err.errors)[0].message });
     }
-    res.status(500).json({ success: false, message: 'Server error while creating user.' });
+    if (err.message && err.message.includes('SMTP_EMAIL')) {
+      return res.status(500).json({ success: false, message: 'Email sending is not configured on the server.' });
+    }
+
+    res.status(500).json({ success: false, message: 'Could not send verification email. Please check the address and try again.' });
   }
 });
 
-// PUT /api/admin/users/:id/activate
+// PUT /api/admin/users/:id/activate - manual override (bypasses OTP)
 router.put('/users/:id/activate', async (req, res) => {
   try {
-    const user = await User.findByIdAndUpdate(req.params.id, { isActive: true }, { new: true }).select('-password');
+    const user = await User.findByIdAndUpdate(req.params.id, { isActive: true }, { new: true }).select('-password -otp');
     if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
     res.json({ success: true, message: 'User activated.', user });
   } catch (err) {
@@ -80,10 +108,10 @@ router.put('/users/:id/activate', async (req, res) => {
   }
 });
 
-// PUT /api/admin/users/:id/deactivate
+// PUT /api/admin/users/:id/deactivate - revoke access
 router.put('/users/:id/deactivate', async (req, res) => {
   try {
-    const user = await User.findByIdAndUpdate(req.params.id, { isActive: false }, { new: true }).select('-password');
+    const user = await User.findByIdAndUpdate(req.params.id, { isActive: false }, { new: true }).select('-password -otp');
     if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
     res.json({ success: true, message: 'User deactivated.', user });
   } catch (err) {
@@ -100,7 +128,7 @@ router.put('/users/:id/role', async (req, res) => {
       return res.status(400).json({ success: false, message: 'role must be "admin" or "user".' });
     }
 
-    const user = await User.findByIdAndUpdate(req.params.id, { role }, { new: true }).select('-password');
+    const user = await User.findByIdAndUpdate(req.params.id, { role }, { new: true }).select('-password -otp');
     if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
     res.json({ success: true, message: 'Role updated.', user });
   } catch (err) {

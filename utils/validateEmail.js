@@ -1,6 +1,8 @@
 // utils/validateEmail.js
-// Restricts registration to real-looking @gmail.com addresses only.
-// Rejects other domains and common dummy/fake patterns.
+// Fast format/domain check: must be shaped like a real @gmail.com address.
+// Actual existence is confirmed separately via OTP verification (see
+// utils/otp.js + utils/sendEmail.js + routes/verify.js) - a dummy address
+// can pass this format check but will never receive the OTP.
 
 const GMAIL_REGEX = /^[a-zA-Z0-9](?:[a-zA-Z0-9.]{0,63})@gmail\.com$/;
 
@@ -9,14 +11,10 @@ function isValidGmail(email) {
 
   const trimmed = email.trim().toLowerCase();
 
-  // Reject leading/trailing dots or consecutive dots in the local part -
-  // common patterns in throwaway/dummy addresses (e.g. "..test@gmail.com")
   const localPart = trimmed.split('@')[0] || '';
   if (localPart.startsWith('.') || localPart.endsWith('.') || localPart.includes('..')) {
     return false;
   }
-
-  // Gmail requires at least 6 characters in the local part for real accounts
   if (localPart.length < 6) return false;
 
   return GMAIL_REGEX.test(trimmed);
