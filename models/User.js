@@ -24,7 +24,19 @@ const userSchema = new mongoose.Schema({
   password: { type: String, required: true },
   role: { type: String, enum: ['admin', 'user'], default: 'user' },
 
+  // isActive = admin has approved login access.
   isActive: { type: Boolean, default: false },
+
+  // emailVerified = user proved they own this inbox via OTP.
+  // Kept separate from isActive: verifying email is NOT the same as being
+  // approved to log in. Self-registered users still need admin approval
+  // after verifying; admin-created users are auto-approved on OTP verify
+  // since an admin already vetted them by creating the account.
+  emailVerified: { type: Boolean, default: false },
+
+  // 'self'  = user registered themselves via the public Register form -> needs admin approval after OTP verify.
+  // 'admin' = an admin created this account -> auto-approved on OTP verify.
+  registrationSource: { type: String, enum: ['self', 'admin'], default: 'self' },
 
   otp: { type: String, default: null },
   otpExpires: { type: Date, default: null },

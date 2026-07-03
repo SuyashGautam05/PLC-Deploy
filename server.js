@@ -140,13 +140,16 @@ app.post('/api/auth/register', withDB(async (req, res) => {
         }
 
         const hashed = await bcrypt.hash(password, 12);
-        createdUser = await User.create({ name, email: normalizedEmail, password: hashed, isActive: false });
+        createdUser = await User.create({
+            name, email: normalizedEmail, password: hashed,
+            isActive: false, emailVerified: false, registrationSource: 'self'
+        });
 
         await issueOtp(createdUser);
 
         res.status(201).json({
             success: true,
-            message: 'Registration successful. Check your email for a verification code, then wait for admin approval.'
+            message: 'Registration successful. Check your email for a verification code. After verifying, an admin will need to approve your account before you can log in.'
         });
     } catch (err) {
         console.error(err);
@@ -228,13 +231,24 @@ app.post('/api/auth/verify-otp', withDB(async (req, res) => {
             return res.status(400).json({ success: false, message: `Incorrect code. ${remaining} attempt(s) remaining.` });
         }
 
-        user.isActive = true;
+        user.emailVerified = true;
         user.otp = null;
         user.otpExpires = null;
         user.otpAttempts = 0;
+
+        // Admin-created accounts are auto-approved on OTP verify since an
+        // admin already vetted them by creating the account. Self-registered
+        // accounts still need a human admin to approve before they can log in.
+        if (user.registrationSource === 'admin') {
+            user.isActive = true;
+        }
         await user.save();
 
-        res.json({ success: true, message: 'Email verified! You can now log in.' });
+        const message = user.isActive
+            ? 'Email verified! You can now log in.'
+            : 'Email verified! Your account is now awaiting admin approval. You will be able to log in once an admin approves it.';
+
+        res.json({ success: true, message });
     } catch (err) {
         console.error(err);
         res.status(500).json({ success: false, message: 'Server error while verifying code.' });
@@ -318,7 +332,8 @@ app.post('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req,
 
         const hashed = await bcrypt.hash(password, 12);
         createdUser = await User.create({
-            name, email: normalizedEmail, password: hashed, role: role || 'user', isActive: false
+            name, email: normalizedEmail, password: hashed, role: role || 'user',
+            isActive: false, emailVerified: false, registrationSource: 'admin'
         });
 
         await issueOtp(createdUser);
@@ -340,8 +355,14 @@ app.post('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req,
 
 app.put('/api/admin/users/:id/activate', authMiddleware, adminMiddleware, withDB(async (req, res) => {
     try {
-        const user = await User.findByIdAndUpdate(req.params.id, { isActive: true }, { new: true }).select('-password -otp');
-        if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+        const target = await User.findById(req.params.id);
+        if (!target) return res.status(404).json({ success: false, message: 'User not found' });
+        if (!target.emailVerified) {
+            return res.status(400).json({ success: false, message: 'Cannot approve: this user has not verified their email yet.' });
+        }
+        target.isActive = true;
+        await target.save();
+        const user = await User.findById(target._id).select('-password -otp');
         res.json({ success: true, message: `${user.name} activated`, user });
     } catch (err) { console.error(err); res.status(500).json({ success: false, message: 'Server error' }); }
 }));
