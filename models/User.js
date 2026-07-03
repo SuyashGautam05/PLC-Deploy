@@ -1,6 +1,12 @@
 const mongoose = require('mongoose');
 
-const GMAIL_REGEX = /^[a-zA-Z0-9](?:[a-zA-Z0-9.]{0,63})@gmail\.com$/;
+// Basic format check only - this stays permissive at the schema level.
+// The stricter "must be a real @gmail.com address" rule is enforced
+// separately in server.js via isValidGmail(), only at account-creation time.
+// Keeping a strict validator HERE would break every .save() on any existing
+// non-Gmail account (e.g. an admin account), since Mongoose re-validates the
+// whole document - including unchanged fields - on every save.
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const userSchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true },
@@ -11,19 +17,22 @@ const userSchema = new mongoose.Schema({
     lowercase: true,
     trim: true,
     validate: {
-      validator: (v) => GMAIL_REGEX.test(v),
-      message: (props) => `${props.value} is not a valid @gmail.com address.`
+      validator: (v) => EMAIL_REGEX.test(v),
+      message: (props) => `${props.value} is not a valid email address.`
     }
   },
-  password: { type: String, required: true }, // bcrypt hash
+  password: { type: String, required: true },
   role: { type: String, enum: ['admin', 'user'], default: 'user' },
 
-  // isActive = true only after the USER verifies their own email via OTP.
-  // Admin can still manually flip this off later to revoke access.
   isActive: { type: Boolean, default: false },
 
-  otp: { type: String, default: null },       // bcrypt-hashed OTP, never stored in plain text
-  otpExpires: { type: Date, default: null }
+  otp: { type: String, default: null },
+  otpExpires: { type: Date, default: null },
+  otpAttempts: { type: Number, default: 0 },
+  otpLastSentAt: { type: Date, default: null },
+
+  apps: { type: [String], default: ['plc-simtel'] },
+  lastLogin: { type: Date }
 }, { timestamps: true });
 
-module.exports = mongoose.model('User', userSchema);
+module.exports = mongoose.models.User || mongoose.model('User', userSchema);

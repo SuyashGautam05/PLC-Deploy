@@ -1,6 +1,9 @@
 // utils/otp.js
+const crypto = require('crypto');
+
+// crypto.randomInt is cryptographically secure (unlike Math.random).
 function generateOTP() {
-  return Math.floor(100000 + Math.random() * 900000).toString(); // 6-digit, e.g. "483920"
+  return crypto.randomInt(100000, 1000000).toString(); // 6-digit
 }
 
 module.exports = { generateOTP };
