@@ -1,8 +1,6 @@
 // utils/validateEmail.js
 // Fast format/domain check: must be shaped like a real @gmail.com address.
-// Actual existence is confirmed separately via OTP verification (see
-// utils/otp.js + utils/sendEmail.js + routes/verify.js) - a dummy address
-// can pass this format check but will never receive the OTP.
+// Actual existence is confirmed separately via OTP verification.
 
 const GMAIL_REGEX = /^[a-zA-Z0-9](?:[a-zA-Z0-9.]{0,63})@gmail\.com$/;
 

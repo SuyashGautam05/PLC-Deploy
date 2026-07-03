@@ -44,12 +44,17 @@ app.get('/', (req, res) => {
 let isConnected = false;
 
 async function connectDB() {
-    if (isConnected) return;
+    if (isConnected && mongoose.connection.readyState === 1) return;
     const rawUri = process.env.MONGODB_URI;
     const mongoUri = rawUri.includes('/?')
         ? rawUri.replace('/?', '/plc-simtel-auth?')
         : rawUri;
-    await mongoose.connect(mongoUri);
+    await mongoose.connect(mongoUri, {
+        serverSelectionTimeoutMS: 5000, // fail fast instead of hanging
+        socketTimeoutMS: 20000,
+        maxPoolSize: 5,                 // keep small - serverless spins up many function instances
+        bufferCommands: false           // don't queue queries while disconnected; surface the real error immediately
+    });
     isConnected = true;
     console.log('MongoDB connected');
 }
