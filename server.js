@@ -154,7 +154,9 @@ app.post('/api/auth/register', withDB(async (req, res) => {
         if (err.name === 'ValidationError') {
             return res.status(400).json({ success: false, message: Object.values(err.errors)[0].message });
         }
-        res.status(500).json({ success: false, message: 'Could not complete registration. Please check the email and try again.' });
+        // TEMPORARY: exposing err.message to diagnose the real cause.
+        // Remove the debug field once fixed - don't leak internals in production.
+        res.status(500).json({ success: false, message: 'Could not complete registration. Please check the email and try again.', debug: err.message });
     }
 }));
 
