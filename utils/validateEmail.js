@@ -13,7 +13,6 @@ function isValidGmail(email) {
   if (localPart.startsWith('.') || localPart.endsWith('.') || localPart.includes('..')) {
     return false;
   }
-  if (localPart.length < 6) return false;
 
   return GMAIL_REGEX.test(trimmed);
 }
