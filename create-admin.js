@@ -33,7 +33,6 @@ async function createAdmin() {
     if (existing) {
         existing.role = 'admin';
         existing.isActive = true;
-        existing.emailVerified = true;
         existing.password = await bcrypt.hash(ADMIN_PASSWORD, 12);
         existing.name = ADMIN_NAME;
         await existing.save();
@@ -45,9 +44,7 @@ async function createAdmin() {
             email,
             password: hashed,
             role: 'admin',
-            isActive: true,
-            emailVerified: true,
-            registrationSource: 'admin'
+            isActive: true
         });
         console.log('\nAdmin account created:');
     }

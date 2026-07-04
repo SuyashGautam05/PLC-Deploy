@@ -119,6 +119,7 @@ async function issueOtp(user) {
 // ══════════════════════════════════════════════════════════════
 
 // Self-registration: needs OTP verification AND admin approval before login.
+// FIX: If email exists but is NOT verified, resend OTP instead of blocking.
 app.post('/api/auth/register', withDB(async (req, res) => {
     let createdUser = null;
     try {
@@ -133,10 +134,30 @@ app.post('/api/auth/register', withDB(async (req, res) => {
         if (!isValidGmail(normalizedEmail)) {
             return res.status(400).json({ success: false, message: 'Only real @gmail.com addresses are allowed.' });
         }
-        if (await User.findOne({ email: normalizedEmail })) {
-            return res.status(409).json({ success: false, message: 'Email already registered' });
+
+        // ── FIX: If user exists but isn't verified, resend OTP ──
+        const existing = await User.findOne({ email: normalizedEmail });
+        if (existing) {
+            if (existing.emailVerified) {
+                // Fully verified user — can't re-register
+                return res.status(409).json({
+                    success: false,
+                    message: 'Email already registered and verified. Please log in instead.',
+                    alreadyVerified: true
+                });
+            }
+            // Unverified user — resend OTP so they aren't stuck
+            console.log(`Re-sending OTP for existing unverified user: ${normalizedEmail}`);
+            await issueOtp(existing);
+            return res.status(200).json({
+                success: true,
+                message: 'A new verification code has been sent to your email.',
+                redirectTo: 'verify-otp',
+                email: normalizedEmail
+            });
         }
 
+        // ── New user: create and send OTP ──
         const hashed = await bcrypt.hash(password, 12);
         createdUser = await User.create({
             name, email: normalizedEmail, password: hashed,
@@ -147,15 +168,17 @@ app.post('/api/auth/register', withDB(async (req, res) => {
 
         res.status(201).json({
             success: true,
-            message: 'Registration successful! Check your email for a verification code.'
+            message: 'Registration successful! Check your email for a verification code.',
+            redirectTo: 'verify-otp',
+            email: normalizedEmail
         });
     } catch (err) {
-        console.error(err);
+        console.error('Register error:', err.message);
         if (createdUser) await User.findByIdAndDelete(createdUser._id).catch(() => {});
         if (err.name === 'ValidationError') {
             return res.status(400).json({ success: false, message: Object.values(err.errors)[0].message });
         }
-        res.status(500).json({ success: false, message: 'Could not complete registration. Please check the email and try again.', debug: err.message });
+        res.status(500).json({ success: false, message: 'Could not complete registration. Please try again.', debug: err.message });
     }
 }));
 
@@ -171,7 +194,7 @@ app.post('/api/auth/login', withDB(async (req, res) => {
             return res.status(401).json({ success: false, message: 'Invalid email or password' });
 
         if (!user.emailVerified)
-            return res.status(403).json({ success: false, message: 'Please verify your email with the code sent to you before logging in.' });
+            return res.status(403).json({ success: false, message: 'Please verify your email with the code sent to you before logging in.', needsVerification: true, email: normalizedEmail });
         if (!user.isActive)
             return res.status(403).json({ success: false, message: 'Your email is verified, but your account is still pending admin approval.' });
 
