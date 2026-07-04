@@ -14,9 +14,9 @@ const { sendOTPEmail } = require('./utils/sendEmail');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const OTP_TTL_MS = 5 * 60 * 1000;        // 5-minute expiry
-const RESEND_COOLDOWN_MS = 60 * 1000;    // 60s between resends
-const MAX_OTP_ATTEMPTS = 5;              // lock after 5 wrong guesses
+const OTP_TTL_MS = 5 * 60 * 1000;
+const RESEND_COOLDOWN_MS = 60 * 1000;
+const MAX_OTP_ATTEMPTS = 5;
 
 // ── CORS ──────────────────────────────────────────────────────
 const rawOrigin = (process.env.CLIENT_ORIGIN || '').replace(/\/$/, '');
@@ -35,7 +35,6 @@ app.use(cors({
 app.options('*', cors());
 app.use(express.json());
 
-// ── Health check (before DB middleware, so it never needs Mongo) ────
 app.get('/', (req, res) => {
     res.json({ status: 'PLC SimTel Auth Server running', time: new Date() });
 });
@@ -50,10 +49,10 @@ async function connectDB() {
         ? rawUri.replace('/?', '/plc-simtel-auth?')
         : rawUri;
     await mongoose.connect(mongoUri, {
-        serverSelectionTimeoutMS: 5000, // fail fast instead of hanging
+        serverSelectionTimeoutMS: 5000,
         socketTimeoutMS: 20000,
-        maxPoolSize: 5,                 // keep small - serverless spins up many function instances
-        bufferCommands: false           // don't queue queries while disconnected; surface the real error immediately
+        maxPoolSize: 5,
+        bufferCommands: false
     });
     isConnected = true;
     console.log('MongoDB connected');
@@ -65,8 +64,6 @@ const withDB = (fn) => async (req, res) => {
         return fn(req, res);
     } catch (err) {
         console.error('DB connection error:', err.message);
-        // TEMPORARY: exposing err.message to diagnose the real cause.
-        // Remove the err.message part once fixed - don't leak internals in production.
         return res.status(500).json({ success: false, message: 'Database connection failed', debug: err.message });
     }
 };
@@ -121,6 +118,7 @@ async function issueOtp(user) {
 //  AUTH ROUTES
 // ══════════════════════════════════════════════════════════════
 
+// Self-registration: needs OTP verification AND admin approval before login.
 app.post('/api/auth/register', withDB(async (req, res) => {
     let createdUser = null;
     try {
@@ -149,7 +147,7 @@ app.post('/api/auth/register', withDB(async (req, res) => {
 
         res.status(201).json({
             success: true,
-            message: 'Registration successful. Check your email for a verification code. After verifying, an admin will need to approve your account before you can log in.'
+            message: 'Registration successful! Check your email for a verification code.'
         });
     } catch (err) {
         console.error(err);
@@ -157,8 +155,6 @@ app.post('/api/auth/register', withDB(async (req, res) => {
         if (err.name === 'ValidationError') {
             return res.status(400).json({ success: false, message: Object.values(err.errors)[0].message });
         }
-        // TEMPORARY: exposing err.message to diagnose the real cause.
-        // Remove the debug field once fixed - don't leak internals in production.
         res.status(500).json({ success: false, message: 'Could not complete registration. Please check the email and try again.', debug: err.message });
     }
 }));
@@ -173,8 +169,11 @@ app.post('/api/auth/login', withDB(async (req, res) => {
         const user = await User.findOne({ email: normalizedEmail });
         if (!user || !(await bcrypt.compare(password, user.password)))
             return res.status(401).json({ success: false, message: 'Invalid email or password' });
+
+        if (!user.emailVerified)
+            return res.status(403).json({ success: false, message: 'Please verify your email with the code sent to you before logging in.' });
         if (!user.isActive)
-            return res.status(403).json({ success: false, message: 'Please verify your email with the code sent to you, then log in.' });
+            return res.status(403).json({ success: false, message: 'Your email is verified, but your account is still pending admin approval.' });
 
         user.lastLogin = new Date();
         await user.save();
@@ -193,7 +192,7 @@ app.post('/api/auth/login', withDB(async (req, res) => {
 app.get('/api/auth/verify', authMiddleware, withDB(async (req, res) => {
     try {
         const user = await User.findById(req.user.id).select('-password -otp');
-        if (!user || !user.isActive)
+        if (!user || !user.isActive || !user.emailVerified)
             return res.status(403).json({ success: false, message: 'Access revoked' });
         res.json({ success: true, user: { name: user.name, email: user.email, role: user.role, apps: user.apps } });
     } catch {
@@ -215,7 +214,7 @@ app.post('/api/auth/verify-otp', withDB(async (req, res) => {
         const user = await User.findOne({ email: normalizedEmail });
 
         if (!user) return res.status(404).json({ success: false, message: 'No account found with this email.' });
-        if (user.isActive) return res.status(400).json({ success: false, message: 'This account is already verified. You can log in.' });
+        if (user.emailVerified) return res.status(400).json({ success: false, message: 'This email is already verified.' });
         if (!user.otp || !user.otpExpires || user.otpExpires < new Date()) {
             return res.status(400).json({ success: false, message: 'This code has expired. Please request a new one.' });
         }
@@ -236,9 +235,8 @@ app.post('/api/auth/verify-otp', withDB(async (req, res) => {
         user.otpExpires = null;
         user.otpAttempts = 0;
 
-        // Admin-created accounts are auto-approved on OTP verify since an
-        // admin already vetted them by creating the account. Self-registered
-        // accounts still need a human admin to approve before they can log in.
+        // Admin-created accounts are already vetted - auto-approve on verify.
+        // Self-registered accounts still need explicit admin approval.
         if (user.registrationSource === 'admin') {
             user.isActive = true;
         }
@@ -246,7 +244,7 @@ app.post('/api/auth/verify-otp', withDB(async (req, res) => {
 
         const message = user.isActive
             ? 'Email verified! You can now log in.'
-            : 'Email verified! Your account is now awaiting admin approval. You will be able to log in once an admin approves it.';
+            : 'Email verified! Your account is now pending admin approval before you can log in.';
 
         res.json({ success: true, message });
     } catch (err) {
@@ -264,7 +262,7 @@ app.post('/api/auth/resend-otp', withDB(async (req, res) => {
         const user = await User.findOne({ email: normalizedEmail });
 
         if (!user) return res.status(404).json({ success: false, message: 'No account found with this email.' });
-        if (user.isActive) return res.status(400).json({ success: false, message: 'This account is already verified. You can log in.' });
+        if (user.emailVerified) return res.status(400).json({ success: false, message: 'This email is already verified.' });
 
         await issueOtp(user);
         res.json({ success: true, message: 'A new code has been sent to your email.' });
@@ -273,7 +271,7 @@ app.post('/api/auth/resend-otp', withDB(async (req, res) => {
             return res.status(429).json({ success: false, message: err.message });
         }
         console.error(err);
-        res.status(500).json({ success: false, message: 'Could not resend code. Please try again.' });
+        res.status(500).json({ success: false, message: 'Could not resend code. Please try again.', debug: err.message });
     }
 }));
 
@@ -289,7 +287,7 @@ app.post('/api/admin/make-admin', withDB(async (req, res) => {
 
         const user = await User.findOneAndUpdate(
             { email: (email || '').trim().toLowerCase() },
-            { role: 'admin', isActive: true },
+            { role: 'admin', isActive: true, emailVerified: true },
             { new: true }
         );
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
@@ -310,8 +308,8 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req, 
     }
 }));
 
-// Admin creates the account, but it stays INACTIVE until the actual user
-// verifies via the OTP emailed to them.
+// Admin creates the account - stays inactive until the USER verifies via OTP,
+// then auto-activates since an admin already vetted this account by creating it.
 app.post('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req, res) => {
     let createdUser = null;
     try {
@@ -340,7 +338,7 @@ app.post('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req,
 
         res.status(201).json({
             success: true,
-            message: 'User created. A verification code has been emailed to them - they must verify it themselves before they can log in.',
+            message: 'User created. A verification code has been emailed to them - once they verify it, their account activates automatically.',
             user: { _id: createdUser._id, name: createdUser.name, email: createdUser.email, role: createdUser.role, isActive: createdUser.isActive }
         });
     } catch (err) {
@@ -349,20 +347,14 @@ app.post('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req,
         if (err.name === 'ValidationError') {
             return res.status(400).json({ success: false, message: Object.values(err.errors)[0].message });
         }
-        res.status(500).json({ success: false, message: 'Could not create user. Please check the email and try again.' });
+        res.status(500).json({ success: false, message: 'Could not create user. Please check the email and try again.', debug: err.message });
     }
 }));
 
 app.put('/api/admin/users/:id/activate', authMiddleware, adminMiddleware, withDB(async (req, res) => {
     try {
-        const target = await User.findById(req.params.id);
-        if (!target) return res.status(404).json({ success: false, message: 'User not found' });
-        if (!target.emailVerified) {
-            return res.status(400).json({ success: false, message: 'Cannot approve: this user has not verified their email yet.' });
-        }
-        target.isActive = true;
-        await target.save();
-        const user = await User.findById(target._id).select('-password -otp');
+        const user = await User.findByIdAndUpdate(req.params.id, { isActive: true }, { new: true }).select('-password -otp');
+        if (!user) return res.status(404).json({ success: false, message: 'User not found' });
         res.json({ success: true, message: `${user.name} activated`, user });
     } catch (err) { console.error(err); res.status(500).json({ success: false, message: 'Server error' }); }
 }));
