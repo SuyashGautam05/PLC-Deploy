@@ -7,6 +7,7 @@ const jwt = require('jsonwebtoken');
 const cors = require('cors');
 
 const User = require('./models/User');
+const Progress = require('./models/Progress');
 const { isValidGmail } = require('./utils/validateEmail');
 const { generateOTP } = require('./utils/otp');
 const { sendOTPEmail } = require('./utils/sendEmail');
@@ -384,6 +385,65 @@ app.delete('/api/admin/users/:id', authMiddleware, adminMiddleware, withDB(async
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
         res.json({ success: true, message: `${user.name} deleted` });
     } catch (err) { console.error(err); res.status(500).json({ success: false, message: 'Server error' }); }
+}));
+
+// ══════════════════════════════════════════════════════════════
+//  PROGRESS TRACKING ROUTES (which topics a user has read)
+// ══════════════════════════════════════════════════════════════
+
+// POST /api/progress/mark-read   body: { topicId, topicTitle, topicUrl, sectionTitle }
+// Called from index.html the moment a topic is opened in the popup.
+app.post('/api/progress/mark-read', authMiddleware, withDB(async (req, res) => {
+    try {
+        const { topicId, topicTitle, topicUrl, sectionTitle, appId } = req.body;
+        if (!topicId) {
+            return res.status(400).json({ success: false, message: 'topicId is required.' });
+        }
+
+        const now = new Date();
+        const progress = await Progress.findOneAndUpdate(
+            { user: req.user.id, topicId },
+            {
+                $set: {
+                    topicTitle: topicTitle || '',
+                    topicUrl: topicUrl || topicId,
+                    sectionTitle: sectionTitle || '',
+                    appId: appId || 'plc-simtel',
+                    lastReadAt: now
+                },
+                $setOnInsert: { firstReadAt: now },
+                $inc: { readCount: 1 }
+            },
+            { upsert: true, new: true }
+        );
+
+        res.json({ success: true, message: 'Progress saved.', progress });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Server error while saving progress.', debug: err.message });
+    }
+}));
+
+// GET /api/progress/my-progress  -  all topics the logged-in user has read
+app.get('/api/progress/my-progress', authMiddleware, withDB(async (req, res) => {
+    try {
+        const topics = await Progress.find({ user: req.user.id }).sort({ lastReadAt: -1 });
+        res.json({ success: true, count: topics.length, topics });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Server error while fetching progress.', debug: err.message });
+    }
+}));
+
+// GET /api/admin/progress/:userId  -  admin view of any user's progress
+app.get('/api/admin/progress/:userId', authMiddleware, adminMiddleware, withDB(async (req, res) => {
+    try {
+        const topics = await Progress.find({ user: req.params.userId }).sort({ lastReadAt: -1 });
+        res.json({ success: true, count: topics.length, topics });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Server error while fetching progress.', debug: err.message });
+    }
 }));
 
 // ── Start: works locally AND exports for Vercel ───────────────
