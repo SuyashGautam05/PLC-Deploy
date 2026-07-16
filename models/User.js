@@ -24,6 +24,12 @@ const userSchema = new mongoose.Schema({
   password: { type: String, required: true },
   role: { type: String, enum: ['admin', 'user'], default: 'user' },
 
+  // College / institute the user belongs to. Free text (not enum) since we
+  // don't control the list of colleges — admin panel groups users by this
+  // value. 'Unspecified' is used as the grouping bucket for legacy accounts
+  // created before this field existed.
+  college: { type: String, trim: true, default: '' },
+
   // isActive = admin has approved login access.
   isActive: { type: Boolean, default: false },
 

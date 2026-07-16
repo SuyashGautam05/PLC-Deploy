@@ -123,11 +123,13 @@ async function issueOtp(user) {
 app.post('/api/auth/register', withDB(async (req, res) => {
     let createdUser = null;
     try {
-        const { name, email, password } = req.body;
-        if (!name || !email || !password)
-            return res.status(400).json({ success: false, message: 'Name, email and password are required' });
+        const { name, email, password, college } = req.body;
+        if (!name || !email || !password || !college)
+            return res.status(400).json({ success: false, message: 'Name, email, password and college are required' });
         if (password.length < 6)
             return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
+        if (college.trim().length < 2)
+            return res.status(400).json({ success: false, message: 'Please enter a valid college/institute name' });
 
         const normalizedEmail = email.trim().toLowerCase();
 
@@ -140,7 +142,7 @@ app.post('/api/auth/register', withDB(async (req, res) => {
 
         const hashed = await bcrypt.hash(password, 12);
         createdUser = await User.create({
-            name, email: normalizedEmail, password: hashed,
+            name, email: normalizedEmail, password: hashed, college: college.trim(),
             isActive: false, emailVerified: false, registrationSource: 'self'
         });
 
@@ -182,7 +184,7 @@ app.post('/api/auth/login', withDB(async (req, res) => {
         res.json({
             success: true,
             token: signToken(user),
-            user: { name: user.name, email: user.email, role: user.role, apps: user.apps }
+            user: { name: user.name, email: user.email, role: user.role, college: user.college, apps: user.apps }
         });
     } catch (err) {
         console.error(err);
@@ -195,7 +197,7 @@ app.get('/api/auth/verify', authMiddleware, withDB(async (req, res) => {
         const user = await User.findById(req.user.id).select('-password -otp');
         if (!user || !user.isActive || !user.emailVerified)
             return res.status(403).json({ success: false, message: 'Access revoked' });
-        res.json({ success: true, user: { name: user.name, email: user.email, role: user.role, apps: user.apps } });
+        res.json({ success: true, user: { name: user.name, email: user.email, role: user.role, college: user.college, apps: user.apps } });
     } catch {
         res.status(500).json({ success: false, message: 'Server error' });
     }
@@ -314,7 +316,7 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req, 
 app.post('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req, res) => {
     let createdUser = null;
     try {
-        const { name, email, password, role } = req.body;
+        const { name, email, password, role, college } = req.body;
         if (!name || !email || !password)
             return res.status(400).json({ success: false, message: 'Name, email and password required' });
         if (password.length < 6)
@@ -332,6 +334,7 @@ app.post('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req,
         const hashed = await bcrypt.hash(password, 12);
         createdUser = await User.create({
             name, email: normalizedEmail, password: hashed, role: role || 'user',
+            college: (college || '').trim(),
             isActive: false, emailVerified: false, registrationSource: 'admin'
         });
 
@@ -340,7 +343,7 @@ app.post('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req,
         res.status(201).json({
             success: true,
             message: 'User created. A verification code has been emailed to them - once they verify it, their account activates automatically.',
-            user: { _id: createdUser._id, name: createdUser.name, email: createdUser.email, role: createdUser.role, isActive: createdUser.isActive }
+            user: { _id: createdUser._id, name: createdUser.name, email: createdUser.email, role: createdUser.role, college: createdUser.college, isActive: createdUser.isActive }
         });
     } catch (err) {
         console.error(err);
@@ -365,6 +368,21 @@ app.put('/api/admin/users/:id/deactivate', authMiddleware, adminMiddleware, with
         const user = await User.findByIdAndUpdate(req.params.id, { isActive: false }, { new: true }).select('-password -otp');
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
         res.json({ success: true, message: `${user.name} deactivated`, user });
+    } catch (err) { console.error(err); res.status(500).json({ success: false, message: 'Server error' }); }
+}));
+
+// Lets an admin fix/assign a user's college (e.g. legacy accounts created
+// before this field existed, or typo corrections) so grouping in the
+// admin panel stays clean.
+app.put('/api/admin/users/:id/college', authMiddleware, adminMiddleware, withDB(async (req, res) => {
+    try {
+        const { college } = req.body;
+        if (typeof college !== 'string' || college.trim().length < 2) {
+            return res.status(400).json({ success: false, message: 'Please provide a valid college/institute name.' });
+        }
+        const user = await User.findByIdAndUpdate(req.params.id, { college: college.trim() }, { new: true }).select('-password -otp');
+        if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+        res.json({ success: true, message: `${user.name}'s college updated`, user });
     } catch (err) { console.error(err); res.status(500).json({ success: false, message: 'Server error' }); }
 }));
 
