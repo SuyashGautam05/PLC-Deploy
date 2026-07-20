@@ -451,14 +451,18 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req, 
     }
 }));
 
-// Admin creates the account - stays inactive until the USER verifies via OTP,
-// then auto-activates since an admin already vetted this account by creating it.
+// Admin creates the account directly. Unlike self-registration, this does
+// NOT go through OTP email verification - the admin already vetted this
+// person by typing in their details themselves, so the account is created
+// already active and the student can log in immediately with the password
+// the admin set. (Sending an OTP here was pointless anyway: the student
+// never visits the register/verify-otp pages, so they had no way to act
+// on the code that got emailed to them - that was the login deadlock.)
 //
 // Scoping: a college admin can only ever create a plain 'user' account, and
 // it's silently pinned to their own college regardless of what's submitted -
 // this is what stops one college admin from planting an account in another
-// college's group. Only the superadmin can create another admin, and must
-// supply a college for that admin to be scoped to.
+// college's group. Only the superadmin can create another admin.
 app.post('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req, res) => {
     let createdUser = null;
     try {
@@ -476,9 +480,13 @@ app.post('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req,
             college = req.user.college; // force to the college admin's own college
         } else {
             role = role === 'admin' ? 'admin' : 'user'; // superadmin can create students or college admins, never another superadmin here
-            if (role === 'admin' && (!college || college.trim().length < 2)) {
-                return res.status(400).json({ success: false, message: 'A college name is required when creating a college admin.' });
-            }
+        }
+
+        // College is required for every account created here, not just
+        // admins - a student with no college can't be matched to a
+        // license seat or show up in the grouped college view.
+        if (!college || college.trim().length < 2) {
+            return res.status(400).json({ success: false, message: 'A college name is required.' });
         }
 
         const normalizedEmail = email.trim().toLowerCase();
@@ -493,15 +501,13 @@ app.post('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req,
         const hashed = await bcrypt.hash(password, 12);
         createdUser = await User.create({
             name, email: normalizedEmail, password: hashed, role,
-            college: (college || '').trim(),
-            isActive: false, emailVerified: false, registrationSource: 'admin'
+            college: college.trim(),
+            isActive: true, emailVerified: true, registrationSource: 'admin'
         });
-
-        await issueOtp(createdUser);
 
         res.status(201).json({
             success: true,
-            message: 'User created. A verification code has been emailed to them - once they verify it, their account activates automatically.',
+            message: `Account created and active. Share these credentials with ${createdUser.name} - they can log in right away.`,
             user: { _id: createdUser._id, name: createdUser.name, email: createdUser.email, role: createdUser.role, college: createdUser.college, isActive: createdUser.isActive }
         });
     } catch (err) {
