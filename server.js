@@ -113,12 +113,37 @@ const superAdminMiddleware = (req, res, next) => {
     next();
 };
 
+// Looks up the REQUESTING admin's own college fresh from the DB, rather
+// than trusting req.user.collegeKey from the JWT. The JWT is only as
+// current as the moment they last logged in - if their collegeKey was ever
+// stale, missing, or got fixed after that login, the token would still
+// carry the old value until they log in again. Resolving it fresh here
+// means scoping is always correct regardless of session age, and as a
+// bonus it self-heals a legacy admin doc that has `college` set but never
+// had `collegeKey` derived (e.g. an account from before that field existed).
+async function resolveRequesterCollege(req) {
+    if (req.user.role === 'superadmin') return { college: null, collegeKey: null };
+    if (req._resolvedCollege) return req._resolvedCollege; // cache per-request
+
+    const me = await User.findById(req.user.id).select('college collegeKey');
+    const college = (me?.college || '').trim();
+    const correctKey = college.toLowerCase();
+
+    if (me && me.collegeKey !== correctKey) {
+        me.collegeKey = correctKey;
+        await me.save().catch(() => {}); // best-effort self-heal, don't block the request on it
+    }
+
+    req._resolvedCollege = { college, collegeKey: correctKey };
+    return req._resolvedCollege;
+}
+
 // A college admin may only ever touch a plain 'user' from their own
 // college. Superadmin bypasses this entirely. Centralized here so every
 // user-management route enforces the boundary identically.
-function canManage(req, targetUser) {
-    if (req.user.role === 'superadmin') return true;
-    return targetUser.role === 'user' && targetUser.collegeKey === req.user.collegeKey;
+function canManage(role, requesterCollegeKey, targetUser) {
+    if (role === 'superadmin') return true;
+    return targetUser.role === 'user' && targetUser.collegeKey === requesterCollegeKey;
 }
 
 // Releases the license seat a user's session was holding (if their college
@@ -440,9 +465,10 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req, 
     try {
         // College admins only ever see their own college's students - never
         // other colleges, and never other admins/the superadmin.
+        const { collegeKey } = await resolveRequesterCollege(req);
         const filter = req.user.role === 'superadmin'
             ? {}
-            : { collegeKey: req.user.collegeKey, role: 'user' };
+            : { collegeKey, role: 'user' };
         const users = await User.find(filter).select('-password -otp -activeSession.token').sort({ createdAt: -1 });
         res.json({ success: true, users });
     } catch (err) {
@@ -477,7 +503,8 @@ app.post('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req,
 
         if (!isSuperAdmin) {
             role = 'user';
-            college = req.user.college; // force to the college admin's own college
+            const { college: myCollege } = await resolveRequesterCollege(req);
+            college = myCollege; // force to the college admin's own college, resolved fresh (not from the JWT snapshot)
         } else {
             role = role === 'admin' ? 'admin' : 'user'; // superadmin can create students or college admins, never another superadmin here
         }
@@ -524,7 +551,8 @@ app.put('/api/admin/users/:id/activate', authMiddleware, adminMiddleware, withDB
     try {
         const user = await User.findById(req.params.id);
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-        if (!canManage(req, user)) return res.status(403).json({ success: false, message: 'You can only manage students from your own college.' });
+        const { collegeKey: _ck } = await resolveRequesterCollege(req);
+        if (!canManage(req.user.role, _ck, user)) return res.status(403).json({ success: false, message: 'You can only manage students from your own college.' });
         user.isActive = true;
         await user.save();
         const safeUser = await User.findById(user._id).select('-password -otp -activeSession.token');
@@ -536,7 +564,8 @@ app.put('/api/admin/users/:id/deactivate', authMiddleware, adminMiddleware, with
     try {
         const user = await User.findById(req.params.id);
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-        if (!canManage(req, user)) return res.status(403).json({ success: false, message: 'You can only manage students from your own college.' });
+        const { collegeKey: _ck } = await resolveRequesterCollege(req);
+        if (!canManage(req.user.role, _ck, user)) return res.status(403).json({ success: false, message: 'You can only manage students from your own college.' });
         user.isActive = false;
         if (user.activeSession && user.activeSession.token) await releaseSeat(user);
         await user.save();
@@ -573,7 +602,8 @@ app.put('/api/admin/users/:id/force-logout', authMiddleware, adminMiddleware, wi
     try {
         const user = await User.findById(req.params.id);
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-        if (!canManage(req, user)) return res.status(403).json({ success: false, message: 'You can only manage students from your own college.' });
+        const { collegeKey: _ck } = await resolveRequesterCollege(req);
+        if (!canManage(req.user.role, _ck, user)) return res.status(403).json({ success: false, message: 'You can only manage students from your own college.' });
         if (!user.activeSession || !user.activeSession.token) {
             return res.status(400).json({ success: false, message: `${user.name} is not currently logged in.` });
         }
@@ -614,7 +644,8 @@ app.delete('/api/admin/users/:id', authMiddleware, adminMiddleware, withDB(async
     try {
         const user = await User.findById(req.params.id);
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-        if (!canManage(req, user)) return res.status(403).json({ success: false, message: 'You can only manage students from your own college.' });
+        const { collegeKey: _ck } = await resolveRequesterCollege(req);
+        if (!canManage(req.user.role, _ck, user)) return res.status(403).json({ success: false, message: 'You can only manage students from your own college.' });
         if (user.activeSession && user.activeSession.token) {
             await releaseSeat(user);
         }
@@ -775,7 +806,8 @@ app.get('/api/admin/progress/:userId', authMiddleware, adminMiddleware, withDB(a
     try {
         const targetUser = await User.findById(req.params.userId);
         if (!targetUser) return res.status(404).json({ success: false, message: 'User not found' });
-        if (!canManage(req, targetUser)) return res.status(403).json({ success: false, message: 'You can only view students from your own college.' });
+        const { collegeKey: _ck } = await resolveRequesterCollege(req);
+        if (!canManage(req.user.role, _ck, targetUser)) return res.status(403).json({ success: false, message: 'You can only view students from your own college.' });
 
         const topics = await Progress.find({ user: req.params.userId }).sort({ lastReadAt: -1 });
         res.json({ success: true, count: topics.length, topics });
