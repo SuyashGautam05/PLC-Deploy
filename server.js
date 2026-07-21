@@ -120,19 +120,19 @@ const superAdminMiddleware = (req, res, next) => {
     next();
 };
 
-// Looks up the REQUESTING admin's own college fresh from the DB, rather
-// than trusting req.user.collegeKey from the JWT. The JWT is only as
-// current as the moment they last logged in - if their collegeKey was ever
-// stale, missing, or got fixed after that login, the token would still
-// carry the old value until they log in again. Resolving it fresh here
-// means scoping is always correct regardless of session age, and as a
-// bonus it self-heals a legacy admin doc that has `college` set but never
-// had `collegeKey` derived (e.g. an account from before that field existed).
+// Looks up the REQUESTING admin's own college (and student quota) fresh
+// from the DB, rather than trusting req.user's JWT snapshot. The JWT is
+// only as current as the moment they last logged in - if their collegeKey
+// or maxStudents was ever stale, missing, or changed after that login, the
+// token would still carry the old value until they log in again. Resolving
+// it fresh here means scoping/quota checks are always correct regardless
+// of session age, and as a bonus it self-heals a legacy admin doc that has
+// `college` set but never had `collegeKey` derived.
 async function resolveRequesterCollege(req) {
-    if (req.user.role === 'superadmin') return { college: null, collegeKey: null };
+    if (req.user.role === 'superadmin') return { college: null, collegeKey: null, maxStudents: null };
     if (req._resolvedCollege) return req._resolvedCollege; // cache per-request
 
-    const me = await User.findById(req.user.id).select('college collegeKey');
+    const me = await User.findById(req.user.id).select('college collegeKey maxStudents');
     const college = (me?.college || '').trim();
     const correctKey = college.toLowerCase();
 
@@ -141,7 +141,7 @@ async function resolveRequesterCollege(req) {
         await me.save().catch(() => {}); // best-effort self-heal, don't block the request on it
     }
 
-    req._resolvedCollege = { college, collegeKey: correctKey };
+    req._resolvedCollege = { college, collegeKey: correctKey, maxStudents: me?.maxStudents ?? null };
     return req._resolvedCollege;
 }
 
@@ -343,7 +343,7 @@ app.post('/api/auth/login', withDB(async (req, res) => {
         res.json({
             success: true,
             token: signToken(user, sid),
-            user: { name: user.name, email: user.email, role: user.role, college: user.college, apps: user.apps }
+            user: { name: user.name, email: user.email, role: user.role, college: user.college, maxStudents: user.maxStudents, apps: user.apps }
         });
     } catch (err) {
         console.error(err);
@@ -377,7 +377,7 @@ app.get('/api/auth/verify', authMiddleware, withDB(async (req, res) => {
         user.activeSession.lastSeenAt = new Date();
         await user.save();
 
-        res.json({ success: true, user: { name: user.name, email: user.email, role: user.role, college: user.college, apps: user.apps } });
+        res.json({ success: true, user: { name: user.name, email: user.email, role: user.role, college: user.college, maxStudents: user.maxStudents, apps: user.apps } });
     } catch {
         res.status(500).json({ success: false, message: 'Server error' });
     }
@@ -513,7 +513,7 @@ app.post('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req,
     try {
         const isSuperAdmin = req.user.role === 'superadmin';
         const { name, email, password } = req.body;
-        let { role, college } = req.body;
+        let { role, college, maxStudents } = req.body;
 
         if (!name || !email || !password)
             return res.status(400).json({ success: false, message: 'Name, email and password required' });
@@ -522,10 +522,32 @@ app.post('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req,
 
         if (!isSuperAdmin) {
             role = 'user';
-            const { college: myCollege } = await resolveRequesterCollege(req);
+            const { college: myCollege, collegeKey: myCollegeKey, maxStudents: myQuota } = await resolveRequesterCollege(req);
             college = myCollege; // force to the college admin's own college, resolved fresh (not from the JWT snapshot)
+
+            // Enforce this admin's student-creation quota (set by the
+            // superadmin). null quota = unlimited (legacy admins from
+            // before this field existed).
+            if (myQuota !== null) {
+                const currentCount = await User.countDocuments({ collegeKey: myCollegeKey, role: 'user' });
+                if (currentCount >= myQuota) {
+                    return res.status(403).json({
+                        success: false,
+                        message: `You've reached your student limit (${currentCount}/${myQuota}). Ask the super admin to raise it if you need to add more.`
+                    });
+                }
+            }
         } else {
             role = role === 'admin' ? 'admin' : 'user'; // superadmin can create students or college admins, never another superadmin here
+            if (role === 'admin') {
+                const quota = Number(maxStudents);
+                if (!Number.isInteger(quota) || quota < 1) {
+                    return res.status(400).json({ success: false, message: 'A student limit (whole number, at least 1) is required when creating a college admin.' });
+                }
+                maxStudents = quota;
+            } else {
+                maxStudents = null;
+            }
         }
 
         // College is required for every account created here, not just
@@ -548,13 +570,14 @@ app.post('/api/admin/users', authMiddleware, adminMiddleware, withDB(async (req,
         createdUser = await User.create({
             name, email: normalizedEmail, password: hashed, role,
             college: college.trim(),
+            maxStudents: role === 'admin' ? maxStudents : null,
             isActive: true, emailVerified: true, registrationSource: 'admin'
         });
 
         res.status(201).json({
             success: true,
             message: `Account created and active. Share these credentials with ${createdUser.name} - they can log in right away.`,
-            user: { _id: createdUser._id, name: createdUser.name, email: createdUser.email, role: createdUser.role, college: createdUser.college, isActive: createdUser.isActive }
+            user: { _id: createdUser._id, name: createdUser.name, email: createdUser.email, role: createdUser.role, college: createdUser.college, maxStudents: createdUser.maxStudents, isActive: createdUser.isActive }
         });
     } catch (err) {
         console.error(err);
@@ -637,7 +660,7 @@ app.put('/api/admin/users/:id/force-logout', authMiddleware, adminMiddleware, wi
 // including themselves or peers.
 app.put('/api/admin/users/:id/role', authMiddleware, adminMiddleware, superAdminMiddleware, withDB(async (req, res) => {
     try {
-        const { role, college } = req.body;
+        const { role, college, maxStudents } = req.body;
         if (!['user', 'admin'].includes(role))
             return res.status(400).json({ success: false, message: 'Role must be user or admin' });
 
@@ -649,13 +672,40 @@ app.put('/api/admin/users/:id/role', authMiddleware, adminMiddleware, superAdmin
             if (targetCollege.length < 2) {
                 return res.status(400).json({ success: false, message: 'A college is required to make someone a college admin.' });
             }
+            const quota = Number(maxStudents);
+            if (!Number.isInteger(quota) || quota < 1) {
+                return res.status(400).json({ success: false, message: 'A student limit (whole number, at least 1) is required to make someone a college admin.' });
+            }
             user.college = targetCollege; // pre-save hook re-derives collegeKey
+            user.maxStudents = quota;
+        } else {
+            user.maxStudents = null; // no longer an admin - quota is meaningless
         }
         user.role = role;
         await user.save();
 
         const safeUser = await User.findById(user._id).select('-password -otp -activeSession.token');
         res.json({ success: true, message: `${user.name} role set to ${role}`, user: safeUser });
+    } catch (err) { console.error(err); res.status(500).json({ success: false, message: 'Server error' }); }
+}));
+
+// Lets the superadmin change an existing college admin's student-creation
+// quota later, without having to demote/repromote them.
+app.put('/api/admin/users/:id/max-students', authMiddleware, adminMiddleware, superAdminMiddleware, withDB(async (req, res) => {
+    try {
+        const quota = Number(req.body.maxStudents);
+        if (!Number.isInteger(quota) || quota < 0) {
+            return res.status(400).json({ success: false, message: 'maxStudents must be a whole number (0 or more).' });
+        }
+        const user = await User.findById(req.params.id);
+        if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+        if (user.role !== 'admin') {
+            return res.status(400).json({ success: false, message: 'Only college admins have a student limit.' });
+        }
+        user.maxStudents = quota;
+        await user.save();
+        const safeUser = await User.findById(user._id).select('-password -otp -activeSession.token');
+        res.json({ success: true, message: `${user.name}'s student limit set to ${quota}`, user: safeUser });
     } catch (err) { console.error(err); res.status(500).json({ success: false, message: 'Server error' }); }
 }));
 

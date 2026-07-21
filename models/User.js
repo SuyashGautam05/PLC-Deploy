@@ -35,6 +35,16 @@ const userSchema = new mongoose.Schema({
   // created before this field existed.
   college: { type: String, trim: true, default: '' },
 
+  // ONLY meaningful when role === 'admin'. Caps how many student ('user')
+  // accounts this college admin is allowed to create in total. Set by the
+  // superadmin at the moment they grant admin access (and editable later).
+  // null = unlimited (e.g. legacy admins promoted before this field
+  // existed). This is a headcount cap on accounts created, independent of
+  // College.licenseLimit which caps simultaneous *logins* - a college admin
+  // could be capped at 50 student accounts while only 20 can be logged in
+  // at once.
+  maxStudents: { type: Number, default: null, min: 0 },
+
   // Lowercase-trimmed mirror of `college`, auto-derived below. This is what
   // license-seat lookups match against (College.nameKey), so a user typing
   // "IET DAVV" vs "iet davv" still hits the same seat pool.
