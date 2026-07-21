@@ -22,13 +22,23 @@ const userSchema = new mongoose.Schema({
     }
   },
   password: { type: String, required: true },
-  role: { type: String, enum: ['admin', 'user'], default: 'user' },
+  // 'superadmin' = software owner (you) - full access to every college, can
+  //   create/remove college admins, manage licenses.
+  // 'admin'      = college admin - scoped to only their own college's
+  //   students (see collegeKey below); cannot see other colleges or admins.
+  // 'user'       = student.
+  role: { type: String, enum: ['superadmin', 'admin', 'user'], default: 'user' },
 
   // College / institute the user belongs to. Free text (not enum) since we
   // don't control the list of colleges — admin panel groups users by this
   // value. 'Unspecified' is used as the grouping bucket for legacy accounts
   // created before this field existed.
   college: { type: String, trim: true, default: '' },
+
+  // Lowercase-trimmed mirror of `college`, auto-derived below. This is what
+  // license-seat lookups match against (College.nameKey), so a user typing
+  // "IET DAVV" vs "iet davv" still hits the same seat pool.
+  collegeKey: { type: String, trim: true, lowercase: true, default: '', index: true },
 
   // isActive = admin has approved login access.
   isActive: { type: Boolean, default: false },
@@ -49,8 +59,38 @@ const userSchema = new mongoose.Schema({
   otpAttempts: { type: Number, default: 0 },
   otpLastSentAt: { type: Date, default: null },
 
+  // Tracks the ONE currently-valid login session for this account. `token`
+  // is a random session id (not the JWT itself) embedded in the JWT's `sid`
+  // claim - a request is only honored if its JWT's sid matches this value.
+  // A second login attempt while this is still ALIVE is rejected, which is
+  // what enforces "one active login per account at a time". "Alive" means
+  // both: within expiresAt (the hard 12h ceiling) AND lastSeenAt is recent
+  // (the periodic /verify poll from auth-guard.js keeps this fresh while a
+  // tab is genuinely open). If a tab is closed without a proper logout,
+  // lastSeenAt simply stops updating and the session goes stale within a
+  // few minutes - so a forgotten/closed tab doesn't lock the account out
+  // for the rest of the 12h window. Set to null whenever the session ends
+  // (logout, expiry, staleness reclaim, or admin force-logout) so the
+  // seat/slot is freed.
+  activeSession: {
+    token: { type: String, default: null },
+    loginAt: { type: Date, default: null },
+    expiresAt: { type: Date, default: null },
+    lastSeenAt: { type: Date, default: null },
+    userAgent: { type: String, default: '' }
+  },
+
   apps: { type: [String], default: ['plc-simtel'] },
   lastLogin: { type: Date }
 }, { timestamps: true });
+
+// Keep collegeKey in sync whenever college changes, so license lookups and
+// admin grouping never drift out of step with the display value.
+userSchema.pre('save', function (next) {
+  if (this.isModified('college')) {
+    this.collegeKey = (this.college || '').trim().toLowerCase();
+  }
+  next();
+});
 
 module.exports = mongoose.models.User || mongoose.model('User', userSchema);
